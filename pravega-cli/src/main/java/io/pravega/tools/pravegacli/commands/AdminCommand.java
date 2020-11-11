@@ -94,13 +94,6 @@ public abstract class AdminCommand {
     }
 
     /**
-     * Creates a new instance of the ServiceConfig class from the shared AdminCommandState.
-     */
-    protected ServiceBuilderConfig getServiceBuilderConfig() {
-        return getCommandArgs().getState().getConfigBuilder().build();
-    }
-
-    /**
      * Creates a new instance of the CuratorFramework class using configuration from the shared AdminCommandState.
      */
     protected CuratorFramework createZKClient() {
@@ -108,7 +101,7 @@ public abstract class AdminCommand {
         CuratorFramework zkClient = CuratorFrameworkFactory
                 .builder()
                 .connectString(serviceConfig.getZkURL())
-                .namespace(serviceConfig.getClusterName())
+                .namespace("pravega/" + serviceConfig.getClusterName())
                 .retryPolicy(new ExponentialBackoffRetry(serviceConfig.getZkRetrySleepMs(), serviceConfig.getZkRetryCount()))
                 .sessionTimeoutMs(serviceConfig.getZkSessionTimeoutMs())
                 .build();
@@ -140,17 +133,11 @@ public abstract class AdminCommand {
     //endregion
 
     //region Arguments
-    protected int getArgCount() {
-        return this.commandArgs.getArgs().size();
-    }
 
     protected void ensureArgCount(int expectedCount) {
         Preconditions.checkArgument(this.commandArgs.getArgs().size() == expectedCount, "Incorrect argument count.");
     }
 
-    protected int getIntArg(int index) {
-        return getArg(index, Integer::parseInt);
-    }
 
     private <T> T getArg(int index, Function<String, T> converter) {
         String s = null;
