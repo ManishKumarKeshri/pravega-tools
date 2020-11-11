@@ -9,7 +9,6 @@
  */
 package io.pravega.tools.pravegacli.commands;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
@@ -18,28 +17,8 @@ import com.google.gson.GsonBuilder;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonParser;
 import io.pravega.common.Exceptions;
+import io.pravega.segmentstore.server.store.ServiceBuilderConfig;
 import io.pravega.segmentstore.server.store.ServiceConfig;
-import io.pravega.tools.pravegacli.commands.admin.PasswordFileCreatorCommand;
-import io.pravega.tools.pravegacli.commands.bookkeeper.BookKeeperCleanupCommand;
-import io.pravega.tools.pravegacli.commands.bookkeeper.BookKeeperDetailsCommand;
-import io.pravega.tools.pravegacli.commands.bookkeeper.BookKeeperDisableCommand;
-import io.pravega.tools.pravegacli.commands.bookkeeper.BookKeeperEnableCommand;
-import io.pravega.tools.pravegacli.commands.bookkeeper.BookKeeperListCommand;
-import io.pravega.tools.pravegacli.commands.cluster.GetSegmentStoreByContainerCommand;
-import io.pravega.tools.pravegacli.commands.cluster.ListContainersCommand;
-import io.pravega.tools.pravegacli.commands.config.ConfigListCommand;
-import io.pravega.tools.pravegacli.commands.bookkeeper.ContainerRecoverCommand;
-import io.pravega.tools.pravegacli.commands.config.ConfigSetCommand;
-import io.pravega.tools.pravegacli.commands.controller.ControllerDescribeReaderGroupCommand;
-import io.pravega.tools.pravegacli.commands.controller.ControllerDescribeScopeCommand;
-import io.pravega.tools.pravegacli.commands.controller.ControllerDescribeStreamCommand;
-import io.pravega.tools.pravegacli.commands.controller.ControllerListReaderGroupsInScopeCommand;
-import io.pravega.tools.pravegacli.commands.controller.ControllerListScopesCommand;
-import io.pravega.tools.pravegacli.commands.controller.ControllerListStreamsInScopeCommand;
-import io.pravega.tools.pravegacli.commands.cluster.GetClusterNodesCommand;
-import io.pravega.tools.pravegacli.commands.utils.CLIControllerConfig;
-import io.pravega.tools.pravegacli.commands.disasterrecovery.DisasterRecoveryCommand;
-import io.pravega.tools.pravegacli.commands.disasterrecovery.StorageListSegmentsCommand;
 import java.io.PrintStream;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -50,11 +29,16 @@ import java.util.Scanner;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
+
+import io.pravega.tools.pravegacli.commands.disasterrecovery.DisasterRecoveryCommand;
+import io.pravega.tools.pravegacli.commands.disasterrecovery.StorageListSegmentsCommand;
 import lombok.AccessLevel;
 import lombok.Data;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.Setter;
+import lombok.SneakyThrows;
+import lombok.extern.slf4j.Slf4j;
 import lombok.val;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
@@ -63,7 +47,8 @@ import org.apache.curator.retry.ExponentialBackoffRetry;
 /**
  * Base class for any command to execute from the Admin tool.
  */
-public abstract class Command {
+@Slf4j
+public abstract class AdminCommand {
     //region Private
 
     @Getter(AccessLevel.PROTECTED)
@@ -83,7 +68,7 @@ public abstract class Command {
      *
      * @param args The arguments for the command.
      */
-    public Command(CommandArgs args) {
+    public AdminCommand(CommandArgs args) {
         this.commandArgs = Preconditions.checkNotNull(args, "commandArgs");
     }
 
@@ -109,10 +94,10 @@ public abstract class Command {
     }
 
     /**
-     * Creates a new instance of the CLIControllerConfig class from the shared AdminCommandState passed in via the Constructor.
+     * Creates a new instance of the ServiceConfig class from the shared AdminCommandState.
      */
-    protected CLIControllerConfig getCLIControllerConfig() {
-        return getCommandArgs().getState().getConfigBuilder().build().getConfig(CLIControllerConfig::builder);
+    protected ServiceBuilderConfig getServiceBuilderConfig() {
+        return getCommandArgs().getState().getConfigBuilder().build();
     }
 
     /**
@@ -123,7 +108,7 @@ public abstract class Command {
         CuratorFramework zkClient = CuratorFrameworkFactory
                 .builder()
                 .connectString(serviceConfig.getZkURL())
-                .namespace("pravega/" + serviceConfig.getClusterName())
+                .namespace(serviceConfig.getClusterName())
                 .retryPolicy(new ExponentialBackoffRetry(serviceConfig.getZkRetrySleepMs(), serviceConfig.getZkRetryCount()))
                 .sessionTimeoutMs(serviceConfig.getZkSessionTimeoutMs())
                 .build();
@@ -155,6 +140,9 @@ public abstract class Command {
     //endregion
 
     //region Arguments
+    protected int getArgCount() {
+        return this.commandArgs.getArgs().size();
+    }
 
     protected void ensureArgCount(int expectedCount) {
         Preconditions.checkArgument(this.commandArgs.getArgs().size() == expectedCount, "Incorrect argument count.");
@@ -162,14 +150,6 @@ public abstract class Command {
 
     protected int getIntArg(int index) {
         return getArg(index, Integer::parseInt);
-    }
-
-    protected long getLongArg(int index) {
-        return getArg(index, Long::parseLong);
-    }
-
-    protected boolean getBooleanArg(int index) {
-        return getArg(index, Boolean::parseBoolean);
     }
 
     private <T> T getArg(int index, Function<String, T> converter) {
@@ -223,26 +203,8 @@ public abstract class Command {
     public static class Factory {
         private static final Map<String, Map<String, CommandInfo>> COMMANDS = registerAll(
                 ImmutableMap.<Supplier<CommandDescriptor>, CommandCreator>builder()
-                        .put(ConfigListCommand::descriptor, ConfigListCommand::new)
-                        .put(ConfigSetCommand::descriptor, ConfigSetCommand::new)
-                        .put(BookKeeperCleanupCommand::descriptor, BookKeeperCleanupCommand::new)
-                        .put(BookKeeperListCommand::descriptor, BookKeeperListCommand::new)
-                        .put(BookKeeperDetailsCommand::descriptor, BookKeeperDetailsCommand::new)
-                        .put(BookKeeperEnableCommand::descriptor, BookKeeperEnableCommand::new)
-                        .put(BookKeeperDisableCommand::descriptor, BookKeeperDisableCommand::new)
-                        .put(ContainerRecoverCommand::descriptor, ContainerRecoverCommand::new)
-                        .put(ControllerListScopesCommand::descriptor, ControllerListScopesCommand::new)
-                        .put(ControllerDescribeScopeCommand::descriptor, ControllerDescribeScopeCommand::new)
-                        .put(ControllerListStreamsInScopeCommand::descriptor, ControllerListStreamsInScopeCommand::new)
-                        .put(ControllerListReaderGroupsInScopeCommand::descriptor, ControllerListReaderGroupsInScopeCommand::new)
-                        .put(ControllerDescribeReaderGroupCommand::descriptor, ControllerDescribeReaderGroupCommand::new)
-                        .put(ControllerDescribeStreamCommand::descriptor, ControllerDescribeStreamCommand::new)
-                        .put(GetClusterNodesCommand::descriptor, GetClusterNodesCommand::new)
-                        .put(ListContainersCommand::descriptor, ListContainersCommand::new)
-                        .put(GetSegmentStoreByContainerCommand::descriptor, GetSegmentStoreByContainerCommand::new)
-                        .put(PasswordFileCreatorCommand::descriptor, PasswordFileCreatorCommand::new)
-                        .put(StorageListSegmentsCommand::descriptor, StorageListSegmentsCommand::new)
                         .put(DisasterRecoveryCommand::descriptor, DisasterRecoveryCommand::new)
+                        .put(StorageListSegmentsCommand::descriptor, StorageListSegmentsCommand::new)
                         .build());
 
         /**
@@ -289,7 +251,7 @@ public abstract class Command {
          * @param args      CommandArgs for the command.
          * @return A new instance of a Command base, already initialized with the command's commandArgs.
          */
-        public static Command get(String component, String command, CommandArgs args) {
+        public static AdminCommand get(String component, String command, CommandArgs args) {
             CommandInfo ci = getCommand(component, command);
             return ci == null ? null : ci.getCreator().apply(args);
         }
@@ -302,7 +264,7 @@ public abstract class Command {
         private static Map<String, Map<String, CommandInfo>> registerAll(Map<Supplier<CommandDescriptor>, CommandCreator> items) {
             val result = new HashMap<String, Map<String, CommandInfo>>();
             for (val e : items.entrySet()) {
-                Command.CommandDescriptor d = e.getKey().get();
+                AdminCommand.CommandDescriptor d = e.getKey().get();
                 Map<String, CommandInfo> componentCommands = result.getOrDefault(d.getComponent(), null);
                 if (componentCommands == null) {
                     componentCommands = new HashMap<>();
@@ -323,7 +285,7 @@ public abstract class Command {
         }
 
         @FunctionalInterface
-        private interface CommandCreator extends Function<CommandArgs, Command> {
+        private interface CommandCreator extends Function<CommandArgs, AdminCommand> {
         }
     }
 
@@ -333,13 +295,9 @@ public abstract class Command {
         private final Object value;
     }
 
+    @SneakyThrows
     private String objectToJSON(Object object) {
-        try {
-            return new ObjectMapper().writeValueAsString(object);
-        } catch (JsonProcessingException e) {
-            System.err.println("Exception parsing object: " + e.getMessage());
-        }
-        return "";
+        return new ObjectMapper().writeValueAsString(object);
     }
 
     //endregion

@@ -18,7 +18,7 @@ import io.pravega.segmentstore.storage.rolling.RollingStorage;
 import io.pravega.shared.segment.SegmentToContainerMapper;
 import io.pravega.storage.filesystem.FileSystemStorage;
 import io.pravega.storage.filesystem.FileSystemStorageConfig;
-import io.pravega.tools.pravegacli.commands.Command;
+import io.pravega.tools.pravegacli.commands.AdminCommand;
 import io.pravega.tools.pravegacli.commands.CommandArgs;
 import lombok.Cleanup;
 import lombok.extern.slf4j.Slf4j;
@@ -27,10 +27,9 @@ import java.io.File;
 import java.io.FileWriter;
 import java.util.Iterator;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledThreadPoolExecutor;
 
 @Slf4j
-public class StorageListSegmentsCommand extends Command {
+public class StorageListSegmentsCommand extends AdminCommand {
 
     protected static final String APPEND_FORMAT = "Segment_%s_Append_%d";
     protected static final long DEFAULT_ROLLING_SIZE = (int) (APPEND_FORMAT.length() * 1.5);
@@ -41,7 +40,6 @@ public class StorageListSegmentsCommand extends Command {
         segToConMapper = new SegmentToContainerMapper(getServiceConfig().getContainerCount());
     }
 
-    @Override
     public void execute() throws Exception {
         ensureArgCount(1);
         String mountPath = getCommandArgs().getArgs().get(0);

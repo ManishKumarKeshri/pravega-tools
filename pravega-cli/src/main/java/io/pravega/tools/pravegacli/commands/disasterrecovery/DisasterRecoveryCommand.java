@@ -27,8 +27,8 @@ import io.pravega.segmentstore.server.attributes.AttributeIndexConfig;
 import io.pravega.segmentstore.server.attributes.AttributeIndexFactory;
 import io.pravega.segmentstore.server.attributes.ContainerAttributeIndexFactoryImpl;
 import io.pravega.segmentstore.server.containers.ContainerConfig;
+import io.pravega.segmentstore.server.containers.ContainerRecoveryUtils;
 import io.pravega.segmentstore.server.containers.DebugStreamSegmentContainer;
-import io.pravega.segmentstore.server.containers.SegmentsRecovery;
 import io.pravega.segmentstore.server.containers.StreamSegmentContainerFactory;
 import io.pravega.segmentstore.server.logs.DurableLogConfig;
 import io.pravega.segmentstore.server.logs.DurableLogFactory;
@@ -53,7 +53,7 @@ import io.pravega.shared.NameUtils;
 import io.pravega.storage.filesystem.FileSystemStorage;
 import io.pravega.storage.filesystem.FileSystemStorageConfig;
 import io.pravega.storage.filesystem.FileSystemStorageFactory;
-import io.pravega.tools.pravegacli.commands.Command;
+import io.pravega.tools.pravegacli.commands.AdminCommand;
 import io.pravega.tools.pravegacli.commands.CommandArgs;
 import lombok.Cleanup;
 import lombok.extern.slf4j.Slf4j;
@@ -75,7 +75,7 @@ import static io.pravega.shared.NameUtils.getMetadataSegmentName;
 import static io.pravega.tools.pravegacli.commands.disasterrecovery.StorageListSegmentsCommand.DEFAULT_ROLLING_SIZE;
 
 @Slf4j
-public class DisasterRecoveryCommand extends Command implements AutoCloseable {
+public class DisasterRecoveryCommand extends AdminCommand implements AutoCloseable {
     protected static final Duration TIMEOUT = Duration.ofMillis(100 * 1000);
     private String root;
     private final StreamSegmentContainerFactory containerFactory;
@@ -167,12 +167,12 @@ public class DisasterRecoveryCommand extends Command implements AutoCloseable {
             System.out.println("Debug Segment container " + containerId + " started.");
 
             // Delete container metadata segment and attributes index segment corresponding to the container Id from the long term storage
-            SegmentsRecovery.deleteContainerMetadataSegments(storage, containerId);
+            ContainerRecoveryUtils.deleteMetadataAndAttributeSegments(storage, containerId, TIMEOUT);
             System.out.println("Container metadata segment and attributes index segment deleted for container Id = " + containerId);
         }
 
         // List segments and recover them
-        SegmentsRecovery.recoverAllSegments(storage, debugStreamSegmentContainerMap, executorService);
+        ContainerRecoveryUtils.recoverAllSegments(storage, debugStreamSegmentContainerMap, executorService, TIMEOUT);
 
         for (int containerId = 0; containerId < getServiceConfig().getContainerCount(); containerId++) {
             // Wait for metadata segment to be flushed to LTS

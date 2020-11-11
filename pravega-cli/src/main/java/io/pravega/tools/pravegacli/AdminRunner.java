@@ -8,21 +8,24 @@
  *     http://www.apache.org/licenses/LICENSE-2.0
  */
 package io.pravega.tools.pravegacli;
-
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.LoggerContext;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Strings;
-import io.pravega.tools.pravegacli.commands.AdminCommandState;
-import io.pravega.tools.pravegacli.commands.Command;
-import io.pravega.tools.pravegacli.commands.CommandArgs;
-import io.pravega.tools.pravegacli.commands.config.ConfigListCommand;
-import io.pravega.tools.pravegacli.commands.utils.ConfigUtils;
+
+import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Scanner;
 import java.util.stream.Collectors;
+
+import io.pravega.tools.pravegacli.commands.AdminCommand;
+import io.pravega.tools.pravegacli.commands.AdminCommandState;
+import io.pravega.tools.pravegacli.commands.CommandArgs;
+import io.pravega.tools.pravegacli.commands.ConfigListCommand;
+import io.pravega.tools.pravegacli.commands.ConfigUtils;
 import lombok.Cleanup;
 import lombok.val;
 import org.slf4j.LoggerFactory;
@@ -37,32 +40,38 @@ public final class AdminRunner {
     /**
      * Main entry point for the Admin Tools Runner.
      * <p>
-     * To speed up setup, create a config.properties file and put the following properties (at a minimum):
+     * To speed up setup, create a admin-cli.properties file and put the following properties (at a minimum):
      * <p>
-     * pravegaservice.containerCount={number of containers}
-     * pravegaservice.zkURL={host:port for ZooKeeper}
-     * cli.controllerRestUri={host:port for a Controller REST API endpoint}
-     * bookkeeper.bkLedgerPath={path in ZooKeeper where BookKeeper stores Ledger metadata}
+     * pravegaservice.container.count={number of containers}
+     * pravegaservice.zk.connect.uri={host:port for ZooKeeper}
+     * cli.controller.rest.uri={host:port for a Controller REST API endpoint}
+     * bookkeeper.ledger.path={path in ZooKeeper where BookKeeper stores Ledger metadata}
      * <p>
      * This program can be executed in two modes. First, the "interactive mode", in which you may want to point to a
      * config file that contains the previous mandatory configuration parameters:
-     * -Dpravega.configurationFile=config.properties
+     * -Dpravega.configurationFile=admin-cli.properties
      *
      * If you don't want to use a config file, you still can load configuration properties dynamically using the command
      * "config set property=value".
      *
      * Second, this program can be executed in "batch mode" to execute a single command. To this end, you need to pass
      * as program argument the command to execute and as properties the configuration parameters (-D flag):
-     * ./pravega-cli controller list-scopes -Dpravegaservice.containerCount={value} -Dpravegaservice.zkURL={value} ...
+     * ./pravega-cli controller list-scopes -Dpravegaservice.container.count={value} -Dpravegaservice.zk.connect.uri={value} ...
      *
      * @param args Arguments.
      * @throws Exception If one occurred.
      */
     public static void main(String[] args) throws Exception {
+        doMain(args);
+        System.exit(0);
+    }
+
+    @VisibleForTesting
+    public static void doMain(String[] args) throws IOException {
         LoggerContext context = (LoggerContext) LoggerFactory.getILoggerFactory();
         context.getLoggerList().get(0).setLevel(Level.ERROR);
 
-        System.out.println("Pravega CLI.\n");
+        System.out.println("Pravega Admin CLI.\n");
         @Cleanup
         AdminCommandState state = new AdminCommandState();
         ConfigUtils.loadProperties(state);
@@ -78,7 +87,6 @@ public final class AdminRunner {
             String commandLine = Arrays.stream(args).collect(Collectors.joining(" ", "", ""));
             processCommand(commandLine, state);
         }
-        System.exit(0);
     }
 
     private static void interactiveMode(AdminCommandState state) {
@@ -93,7 +101,8 @@ public final class AdminRunner {
         }
     }
 
-    private static void processCommand(String line, AdminCommandState state) {
+    @VisibleForTesting
+    public static void processCommand(String line, AdminCommandState state) {
         if (Strings.isNullOrEmpty(line.trim())) {
             return;
         }
@@ -115,7 +124,7 @@ public final class AdminRunner {
     private static void execCommand(Parser.Command pc, AdminCommandState state) {
         CommandArgs cmdArgs = new CommandArgs(pc.getArgs(), state);
         try {
-            Command cmd = Command.Factory.get(pc.getComponent(), pc.getName(), cmdArgs);
+            AdminCommand cmd = AdminCommand.Factory.get(pc.getComponent(), pc.getName(), cmdArgs);
             if (cmd == null) {
                 // No command was found.
                 printHelp(pc);
@@ -131,7 +140,7 @@ public final class AdminRunner {
         }
     }
 
-    private static void printCommandSummary(Command.CommandDescriptor d) {
+    private static void printCommandSummary(AdminCommand.CommandDescriptor d) {
         System.out.println(String.format("\t%s %s %s: %s",
                 d.getComponent(),
                 d.getName(),
@@ -139,28 +148,29 @@ public final class AdminRunner {
                 d.getDescription()));
     }
 
-    private static void printCommandDetails(Parser.Command command) {
-        Command.CommandDescriptor d = Command.Factory.getDescriptor(command.getComponent(), command.getName());
+    @VisibleForTesting
+    public static void printCommandDetails(Parser.Command command) {
+        AdminCommand.CommandDescriptor d = AdminCommand.Factory.getDescriptor(command.getComponent(), command.getName());
         if (d == null) {
             printHelp(command);
             return;
         }
 
         printCommandSummary(d);
-        for (Command.ArgDescriptor ad : d.getArgs()) {
+        for (AdminCommand.ArgDescriptor ad : d.getArgs()) {
             System.out.println(String.format("\t\t%s: %s", formatArgName(ad), ad.getDescription()));
         }
     }
 
     private static void printHelp(Parser.Command command) {
-        Collection<Command.CommandDescriptor> commands;
+        Collection<AdminCommand.CommandDescriptor> commands;
         if (command == null) {
             // All commands.
-            commands = Command.Factory.getDescriptors();
+            commands = AdminCommand.Factory.getDescriptors();
             System.out.println("All available commands:");
         } else {
             // Commands specific to a component.
-            commands = Command.Factory.getDescriptors(command.getComponent());
+            commands = AdminCommand.Factory.getDescriptors(command.getComponent());
             if (commands.isEmpty()) {
                 System.out.println(String.format("No commands are available for component '%s'.", command.getComponent()));
             } else {
@@ -169,11 +179,11 @@ public final class AdminRunner {
         }
 
         commands.stream()
-                .sorted(Comparator.comparing(Command.CommandDescriptor::getComponent).thenComparing(Command.CommandDescriptor::getName))
+                .sorted(Comparator.comparing(AdminCommand.CommandDescriptor::getComponent).thenComparing(AdminCommand.CommandDescriptor::getName))
                 .forEach(AdminRunner::printCommandSummary);
     }
 
-    private static String formatArgName(Command.ArgDescriptor ad) {
+    private static String formatArgName(AdminCommand.ArgDescriptor ad) {
         return String.format("<%s>", ad.getName());
     }
 }
