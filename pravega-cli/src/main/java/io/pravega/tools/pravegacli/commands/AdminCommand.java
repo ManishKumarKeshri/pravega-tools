@@ -109,7 +109,7 @@ public abstract class AdminCommand {
         CuratorFramework zkClient = CuratorFrameworkFactory
                 .builder()
                 .connectString(serviceConfig.getZkURL())
-                .namespace("pravega/" + serviceConfig.getClusterName())
+                .namespace(serviceConfig.getClusterName())
                 .retryPolicy(new ExponentialBackoffRetry(serviceConfig.getZkRetrySleepMs(), serviceConfig.getZkRetryCount()))
                 .sessionTimeoutMs(serviceConfig.getZkSessionTimeoutMs())
                 .build();
