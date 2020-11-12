@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -38,25 +38,16 @@ import io.pravega.segmentstore.server.tables.ContainerTableExtension;
 import io.pravega.segmentstore.server.tables.ContainerTableExtensionImpl;
 import io.pravega.segmentstore.server.writer.StorageWriterFactory;
 import io.pravega.segmentstore.server.writer.WriterConfig;
-import io.pravega.segmentstore.storage.AsyncStorageWrapper;
 import io.pravega.segmentstore.storage.DurableDataLogException;
 import io.pravega.segmentstore.storage.DurableDataLogFactory;
-import io.pravega.segmentstore.storage.SegmentRollingPolicy;
 import io.pravega.segmentstore.storage.Storage;
 import io.pravega.segmentstore.storage.StorageFactory;
 import io.pravega.segmentstore.storage.cache.CacheStorage;
 import io.pravega.segmentstore.storage.cache.DirectMemoryCache;
 import io.pravega.segmentstore.storage.impl.bookkeeper.BookKeeperConfig;
 import io.pravega.segmentstore.storage.impl.bookkeeper.BookKeeperLogFactory;
-import io.pravega.segmentstore.storage.rolling.RollingStorage;
 import io.pravega.shared.NameUtils;
-import io.pravega.storage.filesystem.FileSystemStorage;
-import io.pravega.storage.filesystem.FileSystemStorageConfig;
-import io.pravega.storage.filesystem.FileSystemStorageFactory;
-import io.pravega.tools.pravegacli.commands.AdminCommand;
 import io.pravega.tools.pravegacli.commands.CommandArgs;
-import lombok.Cleanup;
-import lombok.extern.slf4j.Slf4j;
 import lombok.val;
 
 import java.time.Duration;
@@ -70,29 +61,32 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Level;
 
-import static io.pravega.shared.NameUtils.getMetadataSegmentName;
-import static io.pravega.tools.pravegacli.commands.disasterrecovery.StorageListSegmentsCommand.DEFAULT_ROLLING_SIZE;
+/**
+ * Loads the storage instance, recovers all segments from there.
+ */
+public class Tier1RecoveryCommand extends DataRecoveryCommand implements AutoCloseable {
+    private static final int CONTAINER_EPOCH = 1;
+    private static final Duration TIMEOUT = Duration.ofMillis(100 * 1000);
 
-@Slf4j
-public class DisasterRecoveryCommand extends AdminCommand implements AutoCloseable {
-    protected static final Duration TIMEOUT = Duration.ofMillis(100 * 1000);
-    private String root;
-    private final StreamSegmentContainerFactory containerFactory;
+    private final ScheduledExecutorService executorService = ExecutorServiceHelpers.newScheduledThreadPool(100, "recoveryProcessor");
+    private final int containerCount;
     private final StorageFactory storageFactory;
-    private final DurableDataLogFactory dataLogFactory;
-    private final OperationLogFactory operationLogFactory;
-    private final ReadIndexFactory readIndexFactory;
-    private final AttributeIndexFactory attributeIndexFactory;
-    private final WriterFactory writerFactory;
-    private final CacheStorage cacheStorage;
-    private final CacheManager cacheManager;
-    private static final DurableLogConfig DEFAULT_DURABLE_LOG_CONFIG = DurableLogConfig
+    private DurableDataLogFactory dataLogFactory;
+    private StreamSegmentContainerFactory containerFactory;
+    private OperationLogFactory operationLogFactory;
+    private ReadIndexFactory readIndexFactory;
+    private AttributeIndexFactory attributeIndexFactory;
+    private WriterFactory writerFactory;
+    private CacheStorage cacheStorage;
+    private CacheManager cacheManager;
+    // DL config that can be used to simulate no DurableLog truncations.
+    private static final DurableLogConfig NO_TRUNCATIONS_DURABLE_LOG_CONFIG = DurableLogConfig
             .builder()
-            .with(DurableLogConfig.CHECKPOINT_MIN_COMMIT_COUNT, 10)
-            .with(DurableLogConfig.CHECKPOINT_COMMIT_COUNT, 100)
-            .with(DurableLogConfig.CHECKPOINT_TOTAL_COMMIT_LENGTH, 10 * 1024 * 1024L)
-            .with(DurableLogConfig.START_RETRY_DELAY_MILLIS, 20)
+            .with(DurableLogConfig.CHECKPOINT_MIN_COMMIT_COUNT, 10000)
+            .with(DurableLogConfig.CHECKPOINT_COMMIT_COUNT, 50000)
+            .with(DurableLogConfig.CHECKPOINT_TOTAL_COMMIT_LENGTH, 1024 * 1024 * 1024L)
             .build();
     private static final ReadIndexConfig DEFAULT_READ_INDEX_CONFIG = ReadIndexConfig.builder().with(ReadIndexConfig.STORAGE_READ_ALIGNMENT, 1024).build();
 
@@ -102,29 +96,29 @@ public class DisasterRecoveryCommand extends AdminCommand implements AutoCloseab
             .with(AttributeIndexConfig.ATTRIBUTE_SEGMENT_ROLLING_SIZE, 1000)
             .build();
 
-    private static final WriterConfig DEFAULT_WRITER_CONFIG = WriterConfig
+    private static final WriterConfig INFREQUENT_FLUSH_WRITER_CONFIG = WriterConfig
             .builder()
-            .with(WriterConfig.FLUSH_THRESHOLD_BYTES, 1)
-            .with(WriterConfig.FLUSH_THRESHOLD_MILLIS, 25L)
-            .with(WriterConfig.MIN_READ_TIMEOUT_MILLIS, 10L)
-            .with(WriterConfig.MAX_READ_TIMEOUT_MILLIS, 250L)
+            .with(WriterConfig.FLUSH_THRESHOLD_BYTES, 1024 * 1024 * 1024)
+            .with(WriterConfig.FLUSH_ATTRIBUTES_THRESHOLD, 3000)
+            .with(WriterConfig.FLUSH_THRESHOLD_MILLIS, 250000L)
+            .with(WriterConfig.MIN_READ_TIMEOUT_MILLIS, 100L)
+            .with(WriterConfig.MAX_READ_TIMEOUT_MILLIS, 500L)
             .build();
+    private Storage storage;
 
-    ScheduledExecutorService executorService = ExecutorServiceHelpers.newScheduledThreadPool(100, "recoveryProcessor");
-
-    public DisasterRecoveryCommand(CommandArgs args) {
+    /**
+     * Creates an instance of Tier1RecoveryCommand class.
+     *
+     * @param args The arguments for the command.
+     */
+    public Tier1RecoveryCommand(CommandArgs args) {
         super(args);
-        ensureArgCount(1);
-        root = getCommandArgs().getArgs().get(0);
-        if(!root.endsWith("/"))
-            root += "/";
+        this.containerCount = getServiceConfig().getContainerCount();
+        this.storageFactory = createStorageFactory(executorService);
 
         val config = getCommandArgs().getState().getConfigBuilder().build().getConfig(ContainerConfig::builder);
-        //TODO: which storageFactory to instantiate?
-        FileSystemStorageConfig fsConfig = FileSystemStorageConfig.builder()
-                .with(FileSystemStorageConfig.ROOT, getCommandArgs().getArgs().get(0))
-                .build();
-        this.storageFactory = new FileSystemStorageFactory(fsConfig, executorService);
+
+        // Start a zk client and create a bookKeeperLogFactory
         val bkConfig = getCommandArgs().getState().getConfigBuilder()
                 .include(BookKeeperConfig.builder().with(BookKeeperConfig.ZK_ADDRESS, getServiceConfig().getZkURL()))
                 .build().getConfig(BookKeeperConfig::builder);
@@ -133,58 +127,20 @@ public class DisasterRecoveryCommand extends AdminCommand implements AutoCloseab
         this.dataLogFactory = new BookKeeperLogFactory(bkConfig, zkClient, executorService);
         try {
             this.dataLogFactory.initialize();
-        } catch (DurableDataLogException e) {
-            e.printStackTrace();
+        } catch (DurableDataLogException ex) {
+            zkClient.close();
+            ex.printStackTrace();
         }
-        this.operationLogFactory = new DurableLogFactory(DEFAULT_DURABLE_LOG_CONFIG, dataLogFactory, executorService);
+
+        this.operationLogFactory = new DurableLogFactory(NO_TRUNCATIONS_DURABLE_LOG_CONFIG, this.dataLogFactory, executorService);
         this.cacheStorage = new DirectMemoryCache(Integer.MAX_VALUE);
         this.cacheManager = new CacheManager(CachePolicy.INFINITE, this.cacheStorage, executorService);
         this.readIndexFactory = new ContainerReadIndexFactory(DEFAULT_READ_INDEX_CONFIG, this.cacheManager, executorService);
         this.attributeIndexFactory = new ContainerAttributeIndexFactoryImpl(DEFAULT_ATTRIBUTE_INDEX_CONFIG, this.cacheManager, executorService);
-        this.writerFactory = new StorageWriterFactory(DEFAULT_WRITER_CONFIG, executorService);
+        this.writerFactory = new StorageWriterFactory(INFREQUENT_FLUSH_WRITER_CONFIG, executorService);
         this.containerFactory = new StreamSegmentContainerFactory(config, this.operationLogFactory,
                 this.readIndexFactory, this.attributeIndexFactory, this.writerFactory, this.storageFactory,
                 this::createContainerExtensions, executorService);
-    }
-
-    public void execute() throws Exception {
-        FileSystemStorageConfig fsConfig = FileSystemStorageConfig.builder()
-                .with(FileSystemStorageConfig.ROOT, root)
-                .build();
-        @Cleanup
-        Storage storage = new AsyncStorageWrapper(new RollingStorage(new FileSystemStorage(fsConfig), new SegmentRollingPolicy(DEFAULT_ROLLING_SIZE)),
-                executorService);
-
-        Map<Integer, DebugStreamSegmentContainer> debugStreamSegmentContainerMap = new HashMap<>();
-
-        System.out.println("Starting all debug segment containers...");
-        for (int containerId = 0; containerId < getServiceConfig().getContainerCount(); containerId++) {
-            // Start a debug segment container with given id and recover all segments belonging to that container
-            DebugStreamSegmentContainer debugStreamSegmentContainer = (DebugStreamSegmentContainer)
-                    containerFactory.createDebugStreamSegmentContainer(containerId);
-            Services.startAsync(debugStreamSegmentContainer, executorService).join();
-            debugStreamSegmentContainerMap.put(containerId, debugStreamSegmentContainer);
-            System.out.println("Debug Segment container " + containerId + " started.");
-
-            // Delete container metadata segment and attributes index segment corresponding to the container Id from the long term storage
-            ContainerRecoveryUtils.deleteMetadataAndAttributeSegments(storage, containerId, TIMEOUT);
-            System.out.println("Container metadata segment and attributes index segment deleted for container Id = " + containerId);
-        }
-
-        // List segments and recover them
-        ContainerRecoveryUtils.recoverAllSegments(storage, debugStreamSegmentContainerMap, executorService, TIMEOUT);
-
-        for (int containerId = 0; containerId < getServiceConfig().getContainerCount(); containerId++) {
-            // Wait for metadata segment to be flushed to LTS
-            String metadataSegmentName = getMetadataSegmentName(containerId);
-            waitForSegmentsInStorage(Collections.singleton(metadataSegmentName), debugStreamSegmentContainerMap.get(containerId), storage)
-                    .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-
-            // Stop the debug segment container
-            Services.stopAsync(debugStreamSegmentContainerMap.get(containerId), executorService).join();
-            debugStreamSegmentContainerMap.get(containerId).close();
-            System.out.println("Segments have been recovered for container Id: " + containerId);
-        }
     }
 
     private Map<Class<? extends SegmentContainerExtension>, SegmentContainerExtension> createContainerExtensions(
@@ -192,10 +148,77 @@ public class DisasterRecoveryCommand extends AdminCommand implements AutoCloseab
         return Collections.singletonMap(ContainerTableExtension.class, new ContainerTableExtensionImpl(container, this.cacheManager, executor));
     }
 
+    @Override
+    public void execute() throws Exception {
+        // set up logging
+        setLogging(descriptor().getName());
+        output(Level.INFO, "Container Count = %d", this.containerCount);
+
+        this.storage = this.storageFactory.createStorageAdapter();
+        storage.initialize(CONTAINER_EPOCH);
+        output(Level.INFO, "Loaded %s Storage.", getServiceConfig().getStorageImplementation().toString());
+
+        output(Level.INFO, "Starting recovery...");
+        // create back up of metadata segments
+        Map<Integer, String> backUpMetadataSegments = ContainerRecoveryUtils.createBackUpMetadataSegments(storage,
+                this.containerCount, executorService, TIMEOUT);
+
+        // Start debug segment containers
+        Map<Integer, DebugStreamSegmentContainer> debugStreamSegmentContainerMap = createContainers();
+        output(Level.INFO, "Debug segment containers started.");
+
+        output(Level.INFO, "Recovering all segments...");
+        ContainerRecoveryUtils.recoverAllSegments(storage, debugStreamSegmentContainerMap, executorService, TIMEOUT);
+        output(Level.INFO, "All segments recovered.");
+
+        // Update core attributes from the backUp Metadata segments
+        output(Level.INFO, "Updating core attributes for segments registered.");
+        ContainerRecoveryUtils.updateCoreAttributes(backUpMetadataSegments, debugStreamSegmentContainerMap, executorService,
+                TIMEOUT);
+
+        // Waits for metadata segments to be flushed to LTS and then stops the debug segment containers
+        stopDebugSegmentContainersPostFlush(debugStreamSegmentContainerMap);
+
+        output(Level.INFO, "Segments have been recovered.");
+        output(Level.INFO, "Recovery Done!");
+    }
+
+    // Closes the debug segment container instances in the given map after waiting for the metadata segment to be flushed to
+    // the given storage.
+    private void stopDebugSegmentContainersPostFlush(Map<Integer, DebugStreamSegmentContainer> debugStreamSegmentContainerMap)
+            throws Exception {
+        for (val debugSegmentContainerEntry : debugStreamSegmentContainerMap.entrySet()) {
+            output(Level.FINE, "Waiting for metadata segment of container %d to be flushed to the Long-Term storage.",
+                    debugSegmentContainerEntry.getKey());
+            String metadataSegmentName = NameUtils.getMetadataSegmentName(debugSegmentContainerEntry.getKey());
+            waitForSegmentsInStorage(Collections.singleton(metadataSegmentName), debugSegmentContainerEntry.getValue(), storage)
+                    .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            output(Level.FINE, metadataSegmentName + " flushed to the Long-Term Storage.");
+
+            Services.stopAsync(debugSegmentContainerEntry.getValue(), executorService).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            output(Level.FINE, "Stopping debug segment container %d.", debugSegmentContainerEntry.getKey());
+            debugSegmentContainerEntry.getValue().close();
+        }
+    }
+
     public static CommandDescriptor descriptor() {
-        final String component = "dr";
-        return new CommandDescriptor(component, "recover", "reconcile segments from container",
-                new ArgDescriptor("root", "root of the file system"));
+        return new CommandDescriptor(COMPONENT, "Tier1-recovery", "Recover Tier1 state from the storage.");
+    }
+
+    // Creates debug segment container instances, puts them in a map and returns it.
+    private Map<Integer, DebugStreamSegmentContainer> createContainers() {
+        // Start a debug segment container corresponding to the given container Id and put it in the Hashmap with the Id.
+        Map<Integer, DebugStreamSegmentContainer> debugStreamSegmentContainerMap = new HashMap<>();
+
+        // Create a debug segment container instances using a
+        for (int containerId = 0; containerId < this.containerCount; containerId++) {
+            DebugStreamSegmentContainer debugStreamSegmentContainer = (DebugStreamSegmentContainer)
+                    this.containerFactory.createDebugStreamSegmentContainer(containerId);
+            Services.startAsync(debugStreamSegmentContainer, executorService).join();
+            debugStreamSegmentContainerMap.put(containerId, debugStreamSegmentContainer);
+            output(Level.FINE, "Container %d started.", containerId);
+        }
+        return debugStreamSegmentContainerMap;
     }
 
     @Override
@@ -203,7 +226,10 @@ public class DisasterRecoveryCommand extends AdminCommand implements AutoCloseab
         this.cacheManager.close();
         this.cacheStorage.close();
         this.readIndexFactory.close();
-        this.dataLogFactory.close();
+        if (this.dataLogFactory != null) {
+            this.dataLogFactory.close();
+        }
+        storage.close();
     }
 
     private CompletableFuture<Void> waitForSegmentsInStorage(Collection<String> segmentNames, DebugStreamSegmentContainer container,

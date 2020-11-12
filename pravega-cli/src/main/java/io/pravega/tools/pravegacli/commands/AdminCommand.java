@@ -30,8 +30,8 @@ import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
-import io.pravega.tools.pravegacli.commands.disasterrecovery.DisasterRecoveryCommand;
 import io.pravega.tools.pravegacli.commands.disasterrecovery.StorageListSegmentsCommand;
+import io.pravega.tools.pravegacli.commands.disasterrecovery.Tier1RecoveryCommand;
 import lombok.AccessLevel;
 import lombok.Data;
 import lombok.Getter;
@@ -87,6 +87,14 @@ public abstract class AdminCommand {
     public abstract void execute() throws Exception;
 
     /**
+     * Creates a new instance of the ServiceConfig class from the shared AdminCommandState.
+     */
+    protected ServiceBuilderConfig getServiceBuilderConfig() {
+        return getCommandArgs().getState().getConfigBuilder().build();
+    }
+
+
+    /**
      * Creates a new instance of the ServiceConfig class from the shared AdminCommandState passed in via the Constructor.
      */
     protected ServiceConfig getServiceConfig() {
@@ -133,9 +141,17 @@ public abstract class AdminCommand {
     //endregion
 
     //region Arguments
+//region Arguments
+    protected int getArgCount() {
+        return this.commandArgs.getArgs().size();
+    }
 
     protected void ensureArgCount(int expectedCount) {
         Preconditions.checkArgument(this.commandArgs.getArgs().size() == expectedCount, "Incorrect argument count.");
+    }
+
+    protected int getIntArg(int index) {
+        return getArg(index, Integer::parseInt);
     }
 
 
@@ -190,7 +206,7 @@ public abstract class AdminCommand {
     public static class Factory {
         private static final Map<String, Map<String, CommandInfo>> COMMANDS = registerAll(
                 ImmutableMap.<Supplier<CommandDescriptor>, CommandCreator>builder()
-                        .put(DisasterRecoveryCommand::descriptor, DisasterRecoveryCommand::new)
+                        .put(Tier1RecoveryCommand::descriptor, Tier1RecoveryCommand::new)
                         .put(StorageListSegmentsCommand::descriptor, StorageListSegmentsCommand::new)
                         .build());
 

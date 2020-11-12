@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -11,89 +11,126 @@ package io.pravega.tools.pravegacli.commands.disasterrecovery;
 
 import io.pravega.common.concurrent.ExecutorServiceHelpers;
 import io.pravega.segmentstore.contracts.SegmentProperties;
-import io.pravega.segmentstore.storage.AsyncStorageWrapper;
-import io.pravega.segmentstore.storage.SegmentRollingPolicy;
 import io.pravega.segmentstore.storage.Storage;
-import io.pravega.segmentstore.storage.rolling.RollingStorage;
+import io.pravega.segmentstore.storage.StorageFactory;
+import io.pravega.shared.NameUtils;
 import io.pravega.shared.segment.SegmentToContainerMapper;
-import io.pravega.storage.filesystem.FileSystemStorage;
-import io.pravega.storage.filesystem.FileSystemStorageConfig;
-import io.pravega.tools.pravegacli.commands.AdminCommand;
 import io.pravega.tools.pravegacli.commands.CommandArgs;
 import lombok.Cleanup;
-import lombok.extern.slf4j.Slf4j;
 
 import java.io.File;
 import java.io.FileWriter;
+import java.util.Arrays;
 import java.util.Iterator;
+import java.util.List;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.logging.Level;
 
-@Slf4j
-public class StorageListSegmentsCommand extends AdminCommand {
+/**
+ * Lists all non-shadow segments from there from the storage. The storage is loaded using the config properties.
+ */
+public class StorageListSegmentsCommand extends DataRecoveryCommand {
+    /**
+     * Header line for writing segments' details to csv files.
+     */
+    private static final List<String> HEADER = Arrays.asList("Sealed Status", "Length", "Segment Name");
+    private static final int CONTAINER_EPOCH = 1;
+    private final int containerCount;
+    private final ScheduledExecutorService scheduledExecutorService = ExecutorServiceHelpers.newScheduledThreadPool(10,
+            "listSegmentsProcessor");
+    private final SegmentToContainerMapper segToConMapper;
+    private final StorageFactory storageFactory;
+    private final FileWriter[] csvWriters;
+    private String filePath;
 
-    protected static final String APPEND_FORMAT = "Segment_%s_Append_%d";
-    protected static final long DEFAULT_ROLLING_SIZE = (int) (APPEND_FORMAT.length() * 1.5);
-    private SegmentToContainerMapper segToConMapper;
-
+    /**
+     * Creates an instance of StorageListSegmentsCommand class.
+     *
+     * @param args The arguments for the command.
+     */
     public StorageListSegmentsCommand(CommandArgs args) {
         super(args);
-        segToConMapper = new SegmentToContainerMapper(getServiceConfig().getContainerCount());
+        this.containerCount = getServiceConfig().getContainerCount();
+        this.segToConMapper = new SegmentToContainerMapper(this.containerCount);
+        this.storageFactory = createStorageFactory(scheduledExecutorService);
+        this.csvWriters = new FileWriter[this.containerCount];
     }
 
-    public void execute() throws Exception {
-        ensureArgCount(1);
-        String mountPath = getCommandArgs().getArgs().get(0);
-        FileSystemStorageConfig fsConfig = FileSystemStorageConfig.builder()
-                .with(FileSystemStorageConfig.ROOT, mountPath)
-                .build();
-        ScheduledExecutorService scheduledExecutorService = ExecutorServiceHelpers.newScheduledThreadPool(1, "storageProcessor");
+    /**
+     * Creates a csv file for each container. All segments belonging to a containerId have their details written to the
+     * csv file for that container.
+     *
+     * @throws Exception   When failed to create/delete file(s).
+     */
+    private void createCSVFiles() throws Exception {
+        for (int containerId = 0; containerId < this.containerCount; containerId++) {
+            File f = new File(this.filePath + "/" + "Container_" + containerId + ".csv");
+            if (f.exists()) {
+                output(Level.FINE, "File '%s' already exists.", f.getAbsolutePath());
+                if (!f.delete()) {
+                    output(Level.SEVERE, "Failed to delete the file '%s'.", f.getAbsolutePath());
+                    throw new Exception("Failed to delete the file " + f.getAbsolutePath());
+                }
+            }
+            if (!f.createNewFile()) {
+                output(Level.SEVERE, "Failed to create file '%s'.", f.getAbsolutePath());
+                throw new Exception("Failed to create file " + f.getAbsolutePath());
+            }
+            this.csvWriters[containerId] = new FileWriter(f.getName());
+            output(Level.INFO, "Created file '%s'", f.getAbsolutePath());
+            this.csvWriters[containerId].append(String.join(",", HEADER));
+            this.csvWriters[containerId].append("\n");
+        }
+    }
 
+    @Override
+    public void execute() throws Exception {
+        // set up logging
+        this.filePath = setLogging(descriptor().getName());
+
+        output(Level.INFO, "Container Count = %d", this.containerCount);
         // Get the storage using the config.
         @Cleanup
-        Storage storage = new AsyncStorageWrapper(new RollingStorage(new FileSystemStorage(fsConfig), new
-                SegmentRollingPolicy(DEFAULT_ROLLING_SIZE)), scheduledExecutorService);
+        Storage storage = this.storageFactory.createStorageAdapter();
+        storage.initialize(CONTAINER_EPOCH);
+        output(Level.INFO, "Loaded %s Storage.", getServiceConfig().getStorageImplementation().toString());
 
-        int containerCount = segToConMapper.getTotalContainerCount();
+        // Gets total number of segments listed.
+        int segmentsCount = 0;
 
-        // Create a directory for storing files for each container.
-        String logsDirectory = System.getProperty("user.dir") + File.pathSeparator + "segments";
-        File dir = new File(logsDirectory);
-        if (!dir.exists()) dir.mkdirs();
+        createCSVFiles();
 
-        // Create a file for each container.
-        FileWriter[] writers = new FileWriter[containerCount];
-        for (int containerId=0; containerId < containerCount; containerId++) {
-            File f = new File(dir, "Container" + containerId);
-            if(f.exists() && !f.delete()){
-                System.err.println("Failed to delete "+ f.getAbsolutePath());
-                return;
+        output(Level.INFO, "Writing segments' details to the csv files...");
+        Iterator<SegmentProperties> segmentIterator = storage.listSegments();
+        while (segmentIterator.hasNext()) {
+            SegmentProperties currentSegment = segmentIterator.next();
+
+            // skip recovery if the segment is an attribute segment.
+            if (NameUtils.isAttributeSegment(currentSegment.getName())) {
+                continue;
             }
-            if(!f.createNewFile()){
-                System.err.println("Failed to create "+ f.getAbsolutePath());
-                return;
-            }
-            writers[containerId] = new FileWriter(f.getName());
-        }
 
-        System.out.println("Generating container files with the segments they own...");
-        Iterator<SegmentProperties> it = storage.listSegments();
-        while(it.hasNext()) {
-            SegmentProperties currentSegment = it.next();
+            segmentsCount++;
             int containerId = segToConMapper.getContainerId(currentSegment.getName());
-            System.out.println("Segment Name: " + currentSegment.getName() + "\t" + " Sealed status: " + currentSegment.isSealed() +
-                    "\t" + " Length: " + currentSegment.getLength());
-            writers[containerId].write(currentSegment.getLength() + "\t" + currentSegment.isSealed() + "\t" + currentSegment.getName()
-                    + "\n");
+            output(Level.FINE, containerId + "\t" + currentSegment.isSealed() + "\t" + currentSegment.getLength() + "\t" +
+                    currentSegment.getName());
+            csvWriters[containerId].append(currentSegment.isSealed() + "," + currentSegment.getLength() + "," +
+                    currentSegment.getName() + "\n");
         }
-        for (int containerId=0; containerId < containerCount; containerId++) {
-            writers[containerId].close();
+
+        output(Level.FINE, "Closing all csv files...");
+        for (int containerId = 0; containerId < containerCount; containerId++) {
+            csvWriters[containerId].flush();
+            csvWriters[containerId].close();
         }
-        System.out.println("Done!");
+
+        output(Level.INFO, "All non-shadow segments' details have been written to the csv files.");
+        output(Level.FINE, "Path to the csv files: '%s'", filePath);
+        output(Level.INFO, "Total number of segments found = %d", segmentsCount);
+        output(Level.INFO, "Done listing the segments!");
     }
 
     public static CommandDescriptor descriptor() {
-        final String component = "storage";
-        return new CommandDescriptor(component, "list-segments", "lists segments from tier-2 and displays their name, length, sealed status",
-                new ArgDescriptor("root", "mount path"));
+        return new CommandDescriptor(COMPONENT, "list-segments", "Lists segments from storage with their name, length and sealed status.");
     }
 }
